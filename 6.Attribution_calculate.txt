@@ -1,0 +1,698 @@
+
+# 清理环境
+rm(list = ls())
+
+# 加载必要的包
+library(fixest)       # 固定效应模型
+library(data.table)   # 数据处理
+library(readxl)       # 读取Excel文件
+library(writexl)      # 写入Excel文件
+library(dplyr)        # 数据操作
+library(tidyr)        # 数据重塑
+library(ggplot2)      # 数据可视化
+library(RColorBrewer) # 颜色方案
+library(viridis)      # 颜色方案
+library(gridExtra)    # 组合图表
+library(scales)       # 格式化
+library(broom)        # 模型整理
+
+# =============================================================================
+# 辅助函数
+# =============================================================================
+
+# 添加透明度函数
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+# 数据检查函数
+check_data_requirements <- function(data) {
+  cat("=== 数据要求检查 ===\n")
+  
+  required_vars <- c("Y1", "temperature", "pressure", "wind_speed", 
+                     "relative_humidity", "total_precipitation_sum",
+                     "cityid", "year", "week")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("缺失变量:", paste(missing_vars, collapse = ", "), "\n")
+    cat("请确保数据包含以上所有变量\n")
+    return(FALSE)
+  }
+  
+  cat("✓ 所有必需变量都存在\n")
+  cat("温度范围:", round(range(data$temperature, na.rm = TRUE), 1), "°C\n")
+  cat("间日疟疾病例总数:", sum(data$Y1, na.rm = TRUE), "\n")
+  cat("数据行数:", nrow(data), "\n")
+  cat("城市数:", length(unique(data$cityid)), "\n")
+  
+  return(TRUE)
+}
+
+# =============================================================================
+# 1. 数据预处理函数
+# =============================================================================
+
+prepare_malaria_data <- function(data, reference_temp = 16.0) {
+  
+  cat("\n=== 疟疾数据预处理 ===\n")
+  
+  # 基础数据处理
+  data[, year := as.integer(year)]
+  data[, week := as.integer(week)]
+  data[, cityid := as.factor(cityid)]
+  data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+  data[, yearweek := as.factor(yearweek)]
+  
+  # 温度变量
+  data[, temperature_sq := temperature^2]
+  data[, temperature_centered := temperature - reference_temp]
+  data[, temperature_centered_sq := temperature_centered^2]
+  
+  # 人口暴露项
+  if ("population" %in% names(data)) {
+    data[population <= 0 | is.na(population), population := 1]
+    data[, log_population_offset := log(population)]
+    offset_available <- TRUE
+    cat("✓ 人口数据可用，将计算发病率\n")
+  } else {
+    offset_available <- FALSE
+    cat("⚠ 无人口数据，将分析绝对病例数\n")
+  }
+  
+  # 社会经济变量处理
+  if("population_density" %in% names(data)) {
+    data[, log_population_density := log(population_density + 1)]
+    cat("✓ 人口密度变量已处理\n")
+  }
+  if("light_density" %in% names(data)) {
+    data[, log_light_density := log(light_density + 1)]
+    cat("✓ 灯光密度变量已处理\n")
+  }
+  
+  cat("数据预处理完成\n")
+  cat("温度范围:", round(range(data$temperature, na.rm = TRUE), 1), "°C\n")
+  
+  return(list(data = data, offset_available = offset_available))
+}
+
+# =============================================================================
+# 2. 温度分箱函数
+# =============================================================================
+
+create_temperature_bins <- function(data, n_bins = 12, reference_temp = 16) {
+  
+  cat("\n=== 创建温度分箱 ===\n")
+  cat("分箱数量:", n_bins, "\n")
+  cat("参考温度:", reference_temp, "°C\n")
+  
+  # 过滤极端温度（1%和99%分位数之外）
+  temp_p1 <- quantile(data$temperature, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(data$temperature, 0.99, na.rm = TRUE)
+  
+  cat("1%分位数:", round(temp_p1, 1), "°C\n")
+  cat("99%分位数:", round(temp_p99, 1), "°C\n")
+  
+  data_filtered <- data[data$temperature >= temp_p1 & data$temperature <= temp_p99, ]
+  data_filtered <- data_filtered[!is.na(data_filtered$temperature), ]
+  
+  cat("过滤后数据行数:", nrow(data_filtered), "\n")
+  
+  # 计算温度分位数
+  temp_quantiles <- quantile(data_filtered$temperature, 
+                             probs = seq(0, 1, length.out = n_bins + 1), 
+                             na.rm = TRUE)
+  
+  cat("温度分位数切点:\n")
+  print(round(temp_quantiles, 1))
+  
+  # 创建温度分箱
+  data_filtered$temp_bin <- cut(data_filtered$temperature, 
+                                breaks = temp_quantiles,
+                                include.lowest = TRUE,
+                                labels = paste0("tbin", 1:n_bins))
+  
+  # 找到最接近参考温度的分箱
+  temp_bin_centers <- data_filtered %>%
+    group_by(temp_bin) %>%
+    summarise(temp_center = mean(temperature, na.rm = TRUE), .groups = 'drop')
+  
+  closest_bin_idx <- which.min(abs(temp_bin_centers$temp_center - reference_temp))
+  reference_bin <- paste0("tbin", closest_bin_idx)
+  
+  cat("选定参考分箱:", reference_bin, ", 中心温度:", 
+      round(temp_bin_centers$temp_center[closest_bin_idx], 1), "°C\n")
+  
+  data_filtered$temp_bin <- relevel(factor(data_filtered$temp_bin), ref = reference_bin)
+  
+  # 创建分箱统计表
+  bin_stats <- data_filtered %>%
+    group_by(temp_bin) %>%
+    summarise(
+      n_obs = n(),
+      temp_min = round(min(temperature, na.rm = TRUE), 1),
+      temp_max = round(max(temperature, na.rm = TRUE), 1),
+      temp_mean = round(mean(temperature, na.rm = TRUE), 1),
+      cases_total = sum(Y1, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    mutate(temp_range = paste0(temp_min, "-", temp_max, "°C"))
+  
+  cat("\n温度分箱统计:\n")
+  print(bin_stats[, c("temp_bin", "temp_range", "temp_mean", "n_obs", "cases_total")])
+  
+  return(list(
+    data = data_filtered, 
+    bin_stats = bin_stats, 
+    reference_bin = reference_bin,
+    temp_quantiles = temp_quantiles
+  ))
+}
+
+# =============================================================================
+# 3. 分箱模型估计函数
+# =============================================================================
+
+estimate_binned_model <- function(data, reference_bin, n_bins = 12, offset_available = TRUE) {
+  
+  cat("\n=== 估计温度分箱模型 ===\n")
+  cat("参考分箱:", reference_bin, "\n")
+  
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  # 创建分箱指示变量
+  for(i in 1:n_bins) {
+    bin_name <- paste0("tbin", i)
+    data[[paste0("temp_", bin_name)]] <- as.numeric(data$temp_bin == bin_name)
+  }
+  
+  # 构建模型项（排除参考分箱）
+  temp_terms <- c()
+  for(i in 1:n_bins) {
+    if(i != ref_num) {
+      temp_terms <- c(temp_terms, paste0("temp_tbin", i))
+    }
+  }
+  
+  # 控制变量
+  control_vars <- c("pressure", "wind_speed", "relative_humidity", "total_precipitation_sum")
+  
+  # 添加社会经济变量
+  if("log_population_density" %in% names(data)) {
+    control_vars <- c(control_vars, "log_population_density")
+  }
+  if("log_light_density" %in% names(data)) {
+    control_vars <- c(control_vars, "log_light_density")
+  }
+  
+  # 土地利用变量
+  land_use_vars <- c("urban", "water", "forest", "farm")
+  available_land_use <- intersect(land_use_vars, names(data))
+  control_vars <- c(control_vars, available_land_use)
+  
+  formula_str <- paste("Y1 ~", 
+                       paste(control_vars, collapse = " + "), "+",
+                       paste(temp_terms, collapse = " + "),
+                       "| cityid + yearweek")
+  
+  cat("模型估计中 (包含", length(temp_terms), "个温度分箱项)...\n")
+  
+  # 估计模型
+  if (offset_available) {
+    model <- fepois(as.formula(formula_str), 
+                    offset = ~log_population_offset, 
+                    data = data)
+  } else {
+    model <- fepois(as.formula(formula_str), data = data)
+  }
+  
+  cat("模型估计完成，系数数量:", length(coef(model)), "\n")
+  print(summary(model))
+  
+  return(model)
+}
+
+# =============================================================================
+# 4. 计算分箱预测和PAF
+# =============================================================================
+
+calculate_binned_predictions_and_paf <- function(model, bin_stats, reference_bin, n_bins = 12, alpha = 0.05) {
+  
+  cat("\n=== 计算分箱预测和PAF ===\n")
+  
+  coef_est <- coef(model)
+  vcov_matrix <- vcov(model)
+  
+  results <- data.frame()
+  ref_num <- as.numeric(gsub("tbin", "", reference_bin))
+  
+  for(i in 1:n_bins) {
+    bin_name <- paste0("tbin", i)
+    bin_info <- bin_stats[bin_stats$temp_bin == bin_name, ]
+    
+    if(i == ref_num) {
+      # 参考分箱系数为0
+      coef_val <- 0
+      se_val <- 0
+    } else {
+      # 非参考分箱
+      var_name <- paste0("temp_tbin", i)
+      
+      if(var_name %in% names(coef_est)) {
+        coef_val <- coef_est[var_name]
+        se_val <- sqrt(vcov_matrix[var_name, var_name])
+      } else {
+        coef_val <- 0
+        se_val <- 0
+      }
+    }
+    
+    # 计算相对风险比和置信区间
+    rr <- exp(coef_val)
+    ci_lower <- exp(coef_val - qnorm(1 - alpha/2) * se_val)
+    ci_upper <- exp(coef_val + qnorm(1 - alpha/2) * se_val)
+    
+    # 计算PAF (只有当RR > 1时才有正的归因比例)
+    paf <- ifelse(rr > 1, (rr - 1) / rr, 0)
+    paf_lower <- ifelse(ci_lower > 1, (ci_lower - 1) / ci_lower, 0)
+    paf_upper <- ifelse(ci_upper > 1, (ci_upper - 1) / ci_upper, 0)
+    
+    results <- rbind(results, data.frame(
+      temp_bin = bin_name,
+      bin_number = i,
+      temp_mean = bin_info$temp_mean,
+      temp_range = bin_info$temp_range,
+      n_obs = bin_info$n_obs,
+      cases_total = bin_info$cases_total,
+      coefficient = coef_val,
+      std_error = se_val,
+      relative_risk = rr,
+      ci_lower = ci_lower,
+      ci_upper = ci_upper,
+      paf = paf,
+      paf_lower = paf_lower,
+      paf_upper = paf_upper,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # 按温度排序
+  results <- results[order(results$bin_number), ]
+  
+  cat("分箱预测和PAF计算完成,", nrow(results), "个数据点\n")
+  
+  return(results)
+}
+
+# =============================================================================
+# 5. 计算每周归因
+# =============================================================================
+
+calculate_weekly_attribution <- function(data, bin_results) {
+  
+  cat("\n=== 计算每周归因 ===\n")
+  
+  # 为每个观测分配分箱信息和PAF
+  data$temp_bin_assigned <- data$temp_bin
+  data$bin_number <- as.numeric(gsub("tbin", "", data$temp_bin_assigned))
+  
+  # 合并PAF信息
+  data_with_paf <- merge(data, 
+                         bin_results[, c("bin_number", "relative_risk", "paf", 
+                                         "paf_lower", "paf_upper")],
+                         by = "bin_number", all.x = TRUE)
+  
+  # 计算归因病例数
+  data_with_paf$attributable_cases_point <- data_with_paf$Y1 * data_with_paf$paf
+  data_with_paf$attributable_cases_lower <- data_with_paf$Y1 * data_with_paf$paf_lower
+  data_with_paf$attributable_cases_upper <- data_with_paf$Y1 * data_with_paf$paf_upper
+  
+  # 创建输出数据框
+  weekly_attribution <- data_with_paf %>%
+    select(cityid, year, week, yearweek, temperature, temp_bin_assigned, bin_number,
+           Y1, relative_risk, paf, paf_lower, paf_upper,
+           attributable_cases_point, attributable_cases_lower, attributable_cases_upper) %>%
+    rename(
+      city_id = cityid,
+      malaria_cases = Y1,
+      attribution_fraction = paf,
+      attribution_fraction_lower = paf_lower,
+      attribution_fraction_upper = paf_upper
+    ) %>%
+    arrange(city_id, year, week)
+  
+  cat("每周归因数据计算完成,", nrow(weekly_attribution), "条记录\n")
+  
+  return(weekly_attribution)
+}
+
+# =============================================================================
+# 6. 汇总城市级统计
+# =============================================================================
+
+summarize_city_attribution <- function(weekly_attribution) {
+  
+  cat("\n=== 汇总城市级归因统计 ===\n")
+  
+  city_summary <- weekly_attribution %>%
+    group_by(city_id) %>%
+    summarise(
+      # 基础统计
+      total_weeks = n(),
+      total_years = length(unique(year)),
+      
+      # 疟疾病例统计
+      total_malaria_cases = sum(malaria_cases, na.rm = TRUE),
+      avg_weekly_cases = mean(malaria_cases, na.rm = TRUE),
+      
+      # 温度统计
+      mean_temperature = mean(temperature, na.rm = TRUE),
+      min_temperature = min(temperature, na.rm = TRUE),
+      max_temperature = max(temperature, na.rm = TRUE),
+      
+      # 归因统计
+      total_attributable_cases_point = sum(attributable_cases_point, na.rm = TRUE),
+      total_attributable_cases_lower = sum(attributable_cases_lower, na.rm = TRUE),
+      total_attributable_cases_upper = sum(attributable_cases_upper, na.rm = TRUE),
+      
+      # 归因比例统计
+      overall_attribution_rate = sum(attributable_cases_point, na.rm = TRUE) / 
+        sum(malaria_cases, na.rm = TRUE) * 100,
+      overall_attribution_rate_lower = sum(attributable_cases_lower, na.rm = TRUE) / 
+        sum(malaria_cases, na.rm = TRUE) * 100,
+      overall_attribution_rate_upper = sum(attributable_cases_upper, na.rm = TRUE) / 
+        sum(malaria_cases, na.rm = TRUE) * 100,
+      
+      # 高风险周数统计 (RR > 1.5)
+      high_risk_weeks = sum(relative_risk > 1.5, na.rm = TRUE),
+      high_risk_weeks_percent = sum(relative_risk > 1.5, na.rm = TRUE) / n() * 100,
+      
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(total_attributable_cases_point))
+  
+  cat("城市级汇总完成,", nrow(city_summary), "个城市\n")
+  
+  return(city_summary)
+}
+
+# =============================================================================
+# 7. 时间趋势分析
+# =============================================================================
+
+analyze_temporal_trends <- function(weekly_attribution) {
+  
+  cat("\n=== 分析时间趋势 ===\n")
+  
+  # 年度趋势
+  annual_trends <- weekly_attribution %>%
+    group_by(year) %>%
+    summarise(
+      total_cases = sum(malaria_cases, na.rm = TRUE),
+      total_attributable_cases = sum(attributable_cases_point, na.rm = TRUE),
+      attribution_rate = sum(attributable_cases_point, na.rm = TRUE) / 
+        sum(malaria_cases, na.rm = TRUE) * 100,
+      mean_temperature = mean(temperature, na.rm = TRUE),
+      weeks_count = n(),
+      .groups = 'drop'
+    ) %>%
+    arrange(year)
+  
+  # 月度趋势（粗略转换）
+  monthly_trends <- weekly_attribution %>%
+    mutate(month = ceiling(week / 4.33)) %>%  # 粗略转换周到月
+    filter(month <= 12) %>%
+    group_by(month) %>%
+    summarise(
+      total_cases = sum(malaria_cases, na.rm = TRUE),
+      total_attributable_cases = sum(attributable_cases_point, na.rm = TRUE),
+      attribution_rate = sum(attributable_cases_point, na.rm = TRUE) / 
+        sum(malaria_cases, na.rm = TRUE) * 100,
+      mean_temperature = mean(temperature, na.rm = TRUE),
+      observations = n(),
+      .groups = 'drop'
+    ) %>%
+    arrange(month)
+  
+  cat("时间趋势分析完成\n")
+  
+  return(list(
+    annual = annual_trends,
+    monthly = monthly_trends
+  ))
+}
+
+# =============================================================================
+# 8. 可视化函数
+# =============================================================================
+
+create_attribution_plots <- function(bin_results, weekly_attribution, city_summary, save_path) {
+  
+  cat("\n=== 创建归因结果可视化 ===\n")
+  
+  # 1. 温度分箱PAF图
+  paf_plot <- ggplot(bin_results, aes(x = temp_mean, y = paf * 100)) +
+    geom_line(color = "#E74C3C", size = 1.2) +
+    geom_point(color = "#E74C3C", size = 2.5) +
+    geom_ribbon(aes(ymin = paf_lower * 100, ymax = paf_upper * 100), 
+                alpha = 0.3, fill = "#E74C3C") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    labs(title = "Temperature-Specific Population Attributable Fractions",
+         x = "Temperature (°C)",
+         y = "PAF (%)") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(file.path(save_path, "temperature_paf_curve.png"), 
+         paf_plot, width = 10, height = 6, dpi = 300)
+  
+  # 2. 城市归因病例数排名图
+  top_cities <- head(city_summary, 15)
+  
+  city_plot <- ggplot(top_cities, aes(x = reorder(city_id, total_attributable_cases_point))) +
+    geom_bar(aes(y = total_attributable_cases_point), 
+             stat = "identity", fill = "#3498DB", alpha = 0.8) +
+    geom_errorbar(aes(ymin = total_attributable_cases_lower, 
+                      ymax = total_attributable_cases_upper),
+                  width = 0.2, color = "#2980B9") +
+    coord_flip() +
+    labs(title = "Top 15 Cities: Temperature-Attributable Malaria Cases",
+         x = "City ID",
+         y = "Attributable Cases (95% CI)") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(file.path(save_path, "city_attributable_cases_ranking.png"), 
+         city_plot, width = 12, height = 8, dpi = 300)
+  
+  # 3. 温度分箱森林图
+  forest_plot <- ggplot(bin_results, aes(x = relative_risk, y = reorder(temp_bin, temp_mean))) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+    geom_segment(aes(x = ci_lower, xend = ci_upper, y = temp_bin, yend = temp_bin),
+                 size = 1.2, alpha = 0.7, color = "#E74C3C") +
+    geom_point(color = "#E74C3C", size = 3.5) +
+    scale_x_log10(breaks = c(0.5, 1, 2, 5, 10),
+                  labels = c("0.5", "1.0", "2.0", "5.0", "10.0")) +
+    labs(title = "Temperature Bin Effects on Malaria Risk",
+         x = "Relative Risk (95% CI, Log Scale)",
+         y = "Temperature Bins") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(file.path(save_path, "temperature_forest_plot.png"), 
+         forest_plot, width = 10, height = 8, dpi = 300)
+  
+  cat("可视化图表已保存\n")
+}
+
+# =============================================================================
+# 9. 主分析函数
+# =============================================================================
+
+run_complete_temperature_attribution_analysis <- function(
+    data_path = "D:/已结项目数据/秘鲁大论文全部/秘鲁大论文全部/merged_data.xlsx",
+    n_bins = 12,
+    reference_temp = 16.0,
+    save_path = "C:/Users/a1230/Desktop/temperature_attribution_results") {
+  
+  cat("=== 温度归因分析开始 ===\n")
+  cat("数据路径:", data_path, "\n")
+  cat("分箱数量:", n_bins, "\n")
+  cat("参考温度:", reference_temp, "°C\n")
+  cat("结果保存路径:", save_path, "\n")
+  
+  # 确保保存路径存在
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("创建保存路径:", save_path, "\n")
+  }
+  
+  # 步骤1: 读取和检查数据
+  cat("\n步骤1: 读取数据\n")
+  data <- read_excel(data_path)
+  setDT(data)
+  
+  cat("原始数据行数:", nrow(data), "\n")
+  cat("疟疾病例总数:", sum(data$Y1, na.rm = TRUE), "\n")
+  
+  if(!check_data_requirements(data)) {
+    stop("数据检查失败，请检查数据格式")
+  }
+  
+  # 步骤2: 数据预处理
+  cat("\n步骤2: 数据预处理\n")
+  processed_data <- prepare_malaria_data(data, reference_temp)
+  data_processed <- processed_data$data
+  offset_available <- processed_data$offset_available
+  
+  # 步骤3: 创建温度分箱
+  cat("\n步骤3: 创建温度分箱\n")
+  binning_result <- create_temperature_bins(data_processed, n_bins, reference_temp)
+  data_binned <- binning_result$data
+  bin_stats <- binning_result$bin_stats
+  reference_bin <- binning_result$reference_bin
+  
+  # 步骤4: 估计分箱模型
+  cat("\n步骤4: 估计分箱模型\n")
+  model_binned <- estimate_binned_model(data_binned, reference_bin, n_bins, offset_available)
+  
+  # 步骤5: 计算分箱预测和PAF
+  cat("\n步骤5: 计算分箱预测和PAF\n")
+  bin_results <- calculate_binned_predictions_and_paf(model_binned, bin_stats, reference_bin, n_bins)
+  
+  # 步骤6: 计算每周归因
+  cat("\n步骤6: 计算每周归因\n")
+  weekly_attribution <- calculate_weekly_attribution(data_binned, bin_results)
+  
+  # 步骤7: 汇总城市级统计
+  cat("\n步骤7: 汇总城市级统计\n")
+  city_summary <- summarize_city_attribution(weekly_attribution)
+  
+  # 步骤8: 时间趋势分析
+  cat("\n步骤8: 时间趋势分析\n")
+  temporal_trends <- analyze_temporal_trends(weekly_attribution)
+  
+  # 步骤9: 保存结果
+  cat("\n步骤9: 保存结果\n")
+  
+  # 保存每周归因数据
+  write_xlsx(weekly_attribution, 
+             file.path(save_path, "weekly_temperature_attribution.xlsx"))
+  cat("✓ 每周归因数据已保存\n")
+  
+  # 保存城市汇总数据
+  write_xlsx(city_summary, 
+             file.path(save_path, "city_temperature_attribution_summary.xlsx"))
+  cat("✓ 城市汇总数据已保存\n")
+  
+  # 保存分箱结果
+  write_xlsx(bin_results, 
+             file.path(save_path, "temperature_bin_results.xlsx"))
+  cat("✓ 温度分箱结果已保存\n")
+  
+  # 保存时间趋势
+  write_xlsx(temporal_trends$annual, 
+             file.path(save_path, "annual_attribution_trends.xlsx"))
+  write_xlsx(temporal_trends$monthly, 
+             file.path(save_path, "monthly_attribution_trends.xlsx"))
+  cat("✓ 时间趋势数据已保存\n")
+  
+  # 步骤10: 创建可视化
+  cat("\n步骤10: 创建可视化\n")
+  create_attribution_plots(bin_results, weekly_attribution, city_summary, save_path)
+  
+  # 计算全局统计
+  global_stats <- list(
+    total_observations = nrow(weekly_attribution),
+    total_cities = length(unique(weekly_attribution$city_id)),
+    total_malaria_cases = sum(weekly_attribution$malaria_cases, na.rm = TRUE),
+    total_attributable_cases = sum(weekly_attribution$attributable_cases_point, na.rm = TRUE),
+    overall_attribution_rate = sum(weekly_attribution$attributable_cases_point, na.rm = TRUE) / 
+      sum(weekly_attribution$malaria_cases, na.rm = TRUE) * 100,
+    analysis_period = paste(min(weekly_attribution$year), "到", max(weekly_attribution$year)),
+    temperature_range = paste(round(min(weekly_attribution$temperature, na.rm = TRUE), 1), "到",
+                              round(max(weekly_attribution$temperature, na.rm = TRUE), 1), "°C")
+  )
+  
+  # 输出摘要结果
+  cat("\n=== 全局统计结果 ===\n")
+  cat("总观测数:", global_stats$total_observations, "\n")
+  cat("城市数量:", global_stats$total_cities, "\n")
+  cat("疟疾病例总数:", global_stats$total_malaria_cases, "\n")
+  cat("归因病例总数:", round(global_stats$total_attributable_cases, 0), "\n")
+  cat("总体归因比例:", round(global_stats$overall_attribution_rate, 2), "%\n")
+  cat("分析时段:", global_stats$analysis_period, "\n")
+  cat("温度范围:", global_stats$temperature_range, "\n")
+  
+  # 显示分箱摘要
+  cat("\n=== 温度分箱摘要 ===\n")
+  print(bin_results[, c("temp_bin", "temp_range", "relative_risk", "paf")])
+  
+  # 显示城市排名
+  cat("\n=== 前10城市归因病例数 ===\n")
+  print(head(city_summary[, c("city_id", "total_attributable_cases_point", 
+                              "overall_attribution_rate")], 10))
+  
+  cat("\n=== 温度归因分析完成 ===\n")
+  cat("所有结果文件已保存至:", save_path, "\n")
+  
+  return(list(
+    model = model_binned,
+    bin_results = bin_results,
+    weekly_attribution = weekly_attribution,
+    city_summary = city_summary,
+    temporal_trends = temporal_trends,
+    global_stats = global_stats,
+    save_path = save_path
+  ))
+}
+
+# =============================================================================
+# 使用示例
+# =============================================================================
+
+cat("=== 温度归因分析系统 ===\n")
+cat("功能: 基于温度分箱模型计算每个城市每周的归因比例和归因人数\n\n")
+
+cat("主要功能:\n")
+cat("1. ✅ 数据预处理和质量检查\n")
+cat("2. ✅ 温度分箱模型（12分箱，参考温度16°C）\n")
+cat("3. ✅ PAF计算（仅计算RR>1的有害温度分箱）\n")
+cat("4. ✅ 每周归因病例数计算\n")
+cat("5. ✅ 城市级和时间趋势汇总\n")
+cat("6. ✅ 自动可视化生成\n")
+cat("7. ✅ Excel格式结果输出\n\n")
+
+cat("使用方法:\n")
+cat("# 修改数据路径后运行以下代码:\n")
+cat("results <- run_complete_temperature_attribution_analysis(\n")
+cat("  data_path = '你的数据文件路径.xlsx',\n")
+cat("  n_bins = 12,\n")
+cat("  reference_temp = 16.0,\n")
+cat("  save_path = '结果保存路径'\n")
+cat(")\n\n")
+
+cat("输出文件:\n")
+cat("1. weekly_temperature_attribution.xlsx - 每周归因数据\n")
+cat("2. city_temperature_attribution_summary.xlsx - 城市汇总\n")
+cat("3. temperature_bin_results.xlsx - 温度分箱结果\n")
+cat("4. annual_attribution_trends.xlsx - 年度趋势\n")
+cat("5. monthly_attribution_trends.xlsx - 月度趋势\n")
+cat("6. 多个PNG可视化图表\n\n")
+
+cat("重要说明:\n")
+cat("- 数据文件需包含: Y1(间日疟疾), temperature, cityid, year, week等\n")
+cat("- PAF只计算RR>1的温度分箱(有害温度)\n")
+cat("- 归因病例数 = 实际病例数 × PAF\n")
+cat("- 自动过滤1%-99%温度分位数外的极端数据\n\n")
+
+# 运行分析（请根据实际路径修改）
+cat("=== 准备运行分析 ===\n")
+cat("请确认数据路径正确，然后取消下面的注释运行分析:\n\n")
+
+# 运行示例（取消注释以执行）
+results <- run_complete_temperature_attribution_analysis()
+
+cat("=== 代码准备就绪 ===\n")

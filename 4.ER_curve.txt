@@ -1,0 +1,885 @@
+library(fixest)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(readxl)
+
+##############################################################
+# Helper function: Add transparency
+##############################################################
+add.alpha <- function(col, alpha=1) {
+  apply(sapply(col, col2rgb)/255, 2, 
+        function(x) rgb(x[1], x[2], x[3], alpha))
+}
+
+##############################################################
+# 数据预处理函数 - 与原始代码保持一致
+##############################################################
+prepare_vivax_data <- function(data, reference_temp = 16.0) {
+  
+  cat("\n=== 间日疟疾数据预处理 ===\n")
+  
+  # 基础数据处理 - 与原始代码保持一致
+  data[, year := as.integer(year)]
+  data[, week := as.integer(week)]
+  data[, cityid := as.factor(cityid)]
+  data[, yearweek := paste0(year, "_", sprintf("%02d", week))]
+  data[, yearweek := as.factor(yearweek)]
+  
+  # 温度变量
+  data[, temperature_sq := temperature^2]
+  
+  # 人口暴露项
+  if ("population" %in% names(data)) {
+    data[population <= 0 | is.na(population), population := 1]
+    data[, log_population_offset := log(population)]
+    offset_available <- TRUE
+  } else {
+    offset_available <- FALSE
+  }
+  
+  # 社会经济变量处理
+  if("population_density" %in% names(data)) {
+    data[, log_population_density := log(population_density + 1)]
+  }
+  if("light_density" %in% names(data)) {
+    data[, log_light_density := log(light_density + 1)]
+  }
+  
+  # 为可视化创建centered温度变量
+  data[, temperature_centered := temperature - reference_temp]
+  data[, temperature_centered_sq := temperature_centered^2]
+  
+  cat("数据预处理完成\n")
+  cat("温度范围:", round(range(data$temperature, na.rm = TRUE), 1), "°C\n")
+  cat("间日疟疾(Y1)病例总数:", sum(data$Y1, na.rm = TRUE), "\n")
+  
+  return(list(data = data, offset_available = offset_available))
+}
+
+##############################################################
+# 估计间日疟疾模型2 (社会经济变量)
+##############################################################
+estimate_vivax_model2 <- function(data, offset_available, reference_temp = 16.0) {
+  
+  cat("\n=== 估计间日疟疾模型2：社会经济变量 ===\n")
+  
+  # 环境变量
+  env_vars <- c("temperature_centered", "temperature_centered_sq", "pressure", "wind_speed", 
+                "relative_humidity", "total_precipitation_sum")
+  
+  # 社会经济变量
+  socio_vars <- env_vars
+  
+  # 添加可用的社会经济变量
+  if("log_population_density" %in% names(data)) {
+    socio_vars <- c(socio_vars, "log_population_density")
+  }
+  if("log_light_density" %in% names(data)) {
+    socio_vars <- c(socio_vars, "log_light_density")
+  }
+  
+  # 添加土地利用变量
+  land_use_vars <- c("urban", "water", "forest", "farm")
+  available_land_use <- intersect(land_use_vars, names(data))
+  socio_vars <- c(socio_vars, available_land_use)
+  
+  # 模型公式
+  formula_str <- paste("Y1 ~", paste(socio_vars, collapse = " + "), "| cityid + yearweek")
+  
+  cat("间日疟疾模型2公式:\n")
+  cat(formula_str, "\n")
+  
+  # 估计模型
+  if (offset_available) {
+    model <- fepois(as.formula(formula_str), offset = ~log_population_offset, data = data)
+  } else {
+    model <- fepois(as.formula(formula_str), data = data)
+  }
+  
+  cat("间日疟疾模型2估计完成\n")
+  print(summary(model))
+  
+  # 提取温度系数
+  coef_est <- coef(model)
+  if("temperature_centered" %in% names(coef_est) && "temperature_centered_sq" %in% names(coef_est)) {
+    temp_linear_coef <- coef_est["temperature_centered"]
+    temp_quad_coef <- coef_est["temperature_centered_sq"]
+    
+    cat("\n=== 温度系数详情 ===\n")
+    cat("线性温度系数 (β1):", round(temp_linear_coef, 6), "\n")
+    cat("二次温度系数 (β2):", round(temp_quad_coef, 6), "\n")
+    
+    # 计算转折点
+    if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+      turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+      turning_point_actual <- turning_point_centered + reference_temp
+      cat("转折点温度:", round(turning_point_actual, 2), "°C\n")
+    }
+  }
+  
+  return(model)
+}
+
+##############################################################
+# 计算温度边际效应 - 相对风险
+##############################################################
+calculate_vivax_temperature_effects <- function(model, temp_range, reference_temp = 16.0, n_points = 100) {
+  
+  cat("\n=== 计算间日疟疾温度边际效应 ===\n")
+  cat("参考温度:", reference_temp, "°C\n")
+  
+  # 获取系数
+  coef_est <- coef(model)
+  vcov_matrix <- vcov(model)
+  
+  # 检查系数是否存在
+  if(!"temperature_centered" %in% names(coef_est)) {
+    stop("temperature_centered coefficient not found in model")
+  }
+  if(!"temperature_centered_sq" %in% names(coef_est)) {
+    stop("temperature_centered_sq coefficient not found in model")
+  }
+  
+  temp_linear_coef <- coef_est["temperature_centered"]
+  temp_quad_coef <- coef_est["temperature_centered_sq"]
+  
+  cat("线性温度系数 (β1):", temp_linear_coef, "\n")
+  cat("二次温度系数 (β2):", temp_quad_coef, "\n")
+  
+  # 创建温度序列
+  temp_seq <- seq(temp_range[1], temp_range[2], length.out = n_points)
+  temp_seq_centered <- temp_seq - reference_temp  # 中心化
+  
+  # 计算边际效应 (相对于参考温度的相对风险)
+  marginal_effect <- temp_linear_coef * temp_seq_centered + temp_quad_coef * temp_seq_centered^2
+  relative_risk <- exp(marginal_effect)  # 相对于参考温度的RR
+  
+  # 在参考温度处验证应该为1
+  ref_idx <- which.min(abs(temp_seq - reference_temp))
+  cat("参考温度处的边际效应:", round(marginal_effect[ref_idx], 6), "\n")
+  cat("参考温度处的RR:", round(relative_risk[ref_idx], 6), "(应该 = 1.0)\n")
+  
+  # 计算置信区间
+  temp_var <- vcov_matrix["temperature_centered", "temperature_centered"]
+  temp_sq_var <- vcov_matrix["temperature_centered_sq", "temperature_centered_sq"]
+  temp_covar <- vcov_matrix["temperature_centered", "temperature_centered_sq"]
+  
+  # 方差计算
+  pred_var <- temp_seq_centered^2 * temp_var + 
+    temp_seq_centered^4 * temp_sq_var + 
+    2 * temp_seq_centered^3 * temp_covar
+  
+  pred_se <- sqrt(pred_var)
+  
+  ci_lower <- exp(marginal_effect - 1.96 * pred_se)
+  ci_upper <- exp(marginal_effect + 1.96 * pred_se)
+  
+  # 计算转折点
+  if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+    turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+    turning_point_actual <- turning_point_centered + reference_temp
+    cat("转折点温度:", round(turning_point_actual, 2), "°C\n")
+  } else {
+    turning_point_actual <- NA
+  }
+  
+  results <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    marginal_effect = marginal_effect,
+    relative_risk = relative_risk,
+    prediction_se = pred_se,
+    ci_lower = ci_lower,
+    ci_upper = ci_upper,
+    turning_point = turning_point_actual,
+    reference_temp = reference_temp
+  )
+  
+  return(results)
+}
+
+##############################################################
+# 计算间日疟疾绝对风险
+##############################################################
+calculate_vivax_absolute_risk <- function(model, temp_range, data, reference_temp = 16.0, n_points = 100) {
+  
+  cat("\n=== 计算间日疟疾绝对风险（暴露-反应曲线）===\n")
+  cat("参考温度:", reference_temp, "°C\n")
+  
+  # 获取系数
+  coef_est <- coef(model)
+  
+  # 检查温度系数是否存在
+  if(!"temperature_centered" %in% names(coef_est)) {
+    stop("temperature_centered coefficient not found in model")
+  }
+  if(!"temperature_centered_sq" %in% names(coef_est)) {
+    stop("temperature_centered_sq coefficient not found in model")
+  }
+  
+  temp_linear_coef <- coef_est["temperature_centered"]
+  temp_quad_coef <- coef_est["temperature_centered_sq"]
+  
+  cat("中心化温度线性系数 (β1):", temp_linear_coef, "\n")
+  cat("中心化温度二次系数 (β2):", temp_quad_coef, "\n")
+  
+  # 创建温度序列
+  temp_seq <- seq(temp_range[1], temp_range[2], length.out = n_points)
+  temp_seq_centered <- temp_seq - reference_temp  # 中心化
+  
+  # 设置"标准场景"：固定所有控制变量为样本均值
+  cat("\n=== 设置标准场景（控制变量固定为均值）===\n")
+  
+  # 创建标准观测值，所有控制变量取均值
+  standard_scenario <- data.frame(
+    temperature_centered = temp_seq_centered,
+    temperature_centered_sq = temp_seq_centered^2
+  )
+  
+  # 添加其他控制变量的均值
+  control_vars <- c("pressure", "wind_speed", "relative_humidity", "total_precipitation_sum",
+                    "log_population_density", "log_light_density", "urban", "water", "forest", "farm")
+  
+  for(var in control_vars) {
+    if(var %in% names(data) && var %in% names(coef_est)) {
+      mean_val <- mean(data[[var]], na.rm = TRUE)
+      standard_scenario[[var]] <- mean_val
+      cat(sprintf("%s 固定为均值: %.3f\n", var, mean_val))
+    }
+  }
+  
+  # 计算绝对风险（发病率）
+  # 注意：这里计算的是没有固定效应的线性预测
+  linear_pred <- 0  # 初始化
+  
+  # 添加温度项
+  linear_pred <- linear_pred + temp_linear_coef * temp_seq_centered + 
+    temp_quad_coef * temp_seq_centered^2
+  
+  # 添加其他控制变量项
+  for(var in names(standard_scenario)) {
+    if(var %in% names(coef_est) && !grepl("temperature", var)) {
+      linear_pred <- linear_pred + coef_est[var] * standard_scenario[[var]]
+    }
+  }
+  
+  # 计算绝对发病率
+  # 为了得到有意义的绝对值，我们使用观测到的平均发病率作为基线
+  if("Y1" %in% names(data) && "log_population_offset" %in% names(data)) {
+    # 计算样本中的平均发病率（每10万人周）
+    observed_rate <- mean(data$Y1 / exp(data$log_population_offset) * 100000, na.rm = TRUE)
+    cat("观测到的平均发病率:", round(observed_rate, 2), "例/10万人周\n")
+    
+    # 使用参考温度处的预测值作为基线，调整到观测发病率水平
+    ref_idx <- which.min(abs(temp_seq - reference_temp))
+    baseline_adjustment <- log(observed_rate) - linear_pred[ref_idx]
+    
+    # 调整后的绝对发病率
+    absolute_rate <- exp(linear_pred + baseline_adjustment)
+  } else {
+    # 如果没有人口数据，使用相对尺度
+    absolute_rate <- exp(linear_pred)
+    cat("注意：由于缺少人口数据，使用相对尺度\n")
+  }
+  
+  # 计算转折点
+  if(!is.na(temp_quad_coef) && temp_quad_coef != 0) {
+    turning_point_centered <- -temp_linear_coef / (2 * temp_quad_coef)
+    turning_point_actual <- turning_point_centered + reference_temp
+    cat("转折点温度:", round(turning_point_actual, 2), "°C\n")
+  } else {
+    turning_point_actual <- NA
+  }
+  
+  results <- data.frame(
+    temperature = temp_seq,
+    temperature_centered = temp_seq_centered,
+    linear_prediction = linear_pred,
+    absolute_rate = absolute_rate,
+    turning_point = turning_point_actual,
+    reference_temp = reference_temp
+  )
+  
+  cat("绝对风险计算完成\n")
+  
+  return(results)
+}
+
+##############################################################
+# 绘制间日疟疾相对风险分层图 - 优化配色版本（参考第二个代码配色）
+##############################################################
+plot_vivax_temperature_risk_with_distribution <- function(relative_results, temp_data, data, 
+                                                          save_path = "C:/Users/a1230/Desktop/jqxx") {
+  
+  turning_point <- unique(relative_results$turning_point)[1]
+  reference_temp <- unique(relative_results$reference_temp)[1]
+  
+  # 优化配色方案 - 参考第二个代码的配色理念
+  main_line_color <- "#E74C3C"       # 现代红色主线（参考第二个代码的falciparum颜色）
+  ci_fill_color <- "#FADBD8"         # 优雅的浅红色置信区间
+  hist_fill_color <- "#D4EEFC"       # 稍深的浅蓝色直方图
+  grid_color <- "#F0F0F0"            # 更淡的网格线
+  text_color <- "#2C3E50"            # 深蓝灰色文字（更专业）
+  mean_line_color <- "#2C3E50"       # 与文字颜色一致的均值线
+  ref_line_color <- "#3498DB"        # 标准蓝色参考线（参考第二个代码的vivax颜色）
+  p99_line_color <- "#F39C12"        # 橙色P99线（形成良好对比）
+  ref_temp_color <- "#34495E"        # 深灰蓝色参考温度线
+  
+  # 计算1%和99%百分位数 - 使用完整数据确保一致性
+  temp_p1 <- quantile(temp_data, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(temp_data, 0.99, na.rm = TRUE)
+  
+  # 确保分位数在显示范围内
+  display_range <- range(relative_results$temperature)
+  temp_p1_display <- max(temp_p1, display_range[1])
+  temp_p99_display <- min(temp_p99, display_range[2])
+  
+  # 确定图表尺寸和布局参数
+  layout_heights <- c(0.618, 0.382)  # 黄金比例布局
+  
+  # 创建PNG图像
+  png_file <- file.path(save_path, "vivax_temperature_relative_risk_distribution.png")
+  png(filename = png_file, width = 10, height = 8, units = "in", res = 300)
+  
+  # 设置布局
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # 设置绘图参数 - 上图
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.1, cex.lab = 1.2, family = "sans")
+  
+  # 上图：温度对间日疟疾的相对风险
+  rr_range <- range(c(relative_results$relative_risk, relative_results$ci_lower, relative_results$ci_upper), na.rm = TRUE)
+  
+  # 更宽松的Y轴范围设置
+  y_min <- max(0.05, rr_range[1] * 0.5)
+  y_max <- min(20, rr_range[2] * 2.5)
+  
+  plot(relative_results$temperature, relative_results$relative_risk, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(relative_results$temperature),
+       xlab = "", ylab = "", axes = FALSE, log = "y")
+  
+  # 添加网格线
+  temp_breaks <- pretty(relative_results$temperature, n = 8)
+  
+  # 智能Y轴刻度
+  if(y_max <= 3) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 3.0)
+  } else if(y_max <= 8) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0)
+  } else if(y_max <= 15) {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0)
+  } else {
+    y_breaks <- c(0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0)
+  }
+  y_breaks <- y_breaks[y_breaks >= y_min & y_breaks <= y_max]
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # 添加参考线 - 使用优化配色
+  abline(h = 1, col = "gray50", lty = 2, lwd = 1.5)
+  abline(v = reference_temp, col = ref_temp_color, lty = 1, lwd = 2.5)
+  abline(v = temp_p1_display, col = ref_line_color, lty = 2, lwd = 1.8)
+  abline(v = temp_p99_display, col = p99_line_color, lty = 2, lwd = 1.8)
+  
+  # 添加置信区间 - 使用优化配色
+  polygon_x <- c(relative_results$temperature, rev(relative_results$temperature))
+  polygon_y <- c(relative_results$ci_lower, rev(relative_results$ci_upper))
+  polygon(polygon_x, polygon_y, col = add.alpha(ci_fill_color, 0.3), border = NA)
+  
+  # 绘制主曲线 - 使用优化配色
+  lines(relative_results$temperature, relative_results$relative_risk, lwd = 3.5, col = main_line_color)
+  
+  # 添加参考点标记
+  ref_idx <- which.min(abs(relative_results$temperature - reference_temp))
+  points(relative_results$temperature[ref_idx], relative_results$relative_risk[ref_idx], 
+         col = ref_temp_color, pch = 19, cex = 2.0)
+  
+  # 添加转折点标记（如果存在）
+  if(!is.na(turning_point)) {
+    tp_idx <- which.min(abs(relative_results$temperature - turning_point))
+    points(relative_results$temperature[tp_idx], relative_results$relative_risk[tp_idx], 
+           col = main_line_color, pch = 17, cex = 2.0)
+  }
+  
+  # 添加Y轴（对数刻度）
+  axis(2, at = y_breaks, labels = as.character(y_breaks), 
+       las = 1, col.axis = text_color, col = "gray80", cex.axis = 1.1)
+  mtext("Relative Risk (95% CI)", side = 2, line = 3.5, cex = 1.2, col = text_color, font = 2)
+  
+  # 添加标题
+  mtext("Temperature Effect on Vivax Malaria Relative Incidence Risk (Peru)", 
+        side = 3, line = 1, cex = 1.5, font = 2, col = text_color)
+  
+  # 下图：温度频率分布直方图
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # 使用与上图完全相同的X轴范围确保对齐
+  xlim_range <- range(relative_results$temperature)
+  
+  # 过滤温度数据到与上图相同的显示范围
+  temp_filtered <- temp_data[temp_data >= xlim_range[1] & temp_data <= xlim_range[2]]
+  
+  # 创建直方图区间
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  buffer <- 0.1
+  safe_min <- floor(actual_min - buffer)
+  safe_max <- ceiling(actual_max + buffer)
+  
+  hist_breaks <- seq(safe_min, safe_max, by = 1)
+  if (max(hist_breaks) < safe_max) {
+    hist_breaks <- c(hist_breaks, safe_max)
+  }
+  
+  # 创建直方图
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # 绘制直方图背景
+  plot(1, 1, type = "n", 
+       xlim = xlim_range,
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # 添加柱状图 - 使用优化配色
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= xlim_range[2] && hist_breaks[i+1] >= xlim_range[1]) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.8), 
+           border = add.alpha("#BDC3C7", 0.6))
+    }
+  }
+  
+  # 添加X轴
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray80", cex.axis = 1.1)
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color, font = 2)
+  
+  # 添加温度参考线 - 使用优化配色
+  abline(v = reference_temp, col = ref_temp_color, lty = 1, lwd = 2.5)
+  abline(v = temp_p1_display, col = ref_line_color, lty = 2, lwd = 1.8)
+  abline(v = temp_p99_display, col = p99_line_color, lty = 2, lwd = 1.8)
+  
+  # 添加均值线
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = mean_line_color, lty = 1, lwd = 1.8)
+  
+  # 添加Y轴
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray80", cex.axis = 1.1)
+  
+  # 改进的Y轴标签
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # 添加统计信息注释 - 使用优化配色
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = text_color, font = 2)
+  
+  text(temp_p1_display, max(hist_percent) * 0.7, 
+       sprintf("P1: %.1f°C", temp_p1), 
+       cex = 0.9, col = ref_line_color, font = 1)
+  
+  text(temp_p99_display, max(hist_percent) * 0.7, 
+       sprintf("P99: %.1f°C", temp_p99), 
+       cex = 0.9, col = p99_line_color, font = 1)
+  
+  # 添加边框
+  box(col = "gray80")
+  
+  dev.off()
+  
+  cat("间日疟疾相对风险图表已保存至:", png_file, "\n")
+  cat("参考温度:", reference_temp, "°C\n")
+  cat("1%百分位数:", round(temp_p1, 1), "°C\n")
+  cat("99%百分位数:", round(temp_p99, 1), "°C\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# 绘制间日疟疾绝对风险分层图 - 优化配色版本（参考第二个代码配色）
+##############################################################
+plot_vivax_absolute_risk_with_distribution <- function(absolute_results, temp_data, data, 
+                                                       save_path = "C:/Users/a1230/Desktop/jqxx") {
+  
+  turning_point <- unique(absolute_results$turning_point)[1]
+  reference_temp <- unique(absolute_results$reference_temp)[1]
+  
+  # 优化配色方案 - 与相对风险图保持一致
+  main_line_color <- "#E74C3C"       # 现代红色主线
+  hist_fill_color <- "#D4EEFC"       # 稍深的浅蓝色直方图
+  grid_color <- "#F0F0F0"            # 更淡的网格线
+  text_color <- "#2C3E50"            # 深蓝灰色文字
+  mean_line_color <- "#2C3E50"       # 与文字颜色一致的均值线
+  ref_line_color <- "#3498DB"        # 标准蓝色参考线
+  p99_line_color <- "#F39C12"        # 橙色P99线
+  ref_temp_color <- "#34495E"        # 深灰蓝色参考温度线
+  
+  # 计算1%和99%百分位数作为参考线
+  temp_p1 <- quantile(temp_data, 0.01, na.rm = TRUE)
+  temp_p99 <- quantile(temp_data, 0.99, na.rm = TRUE)
+  
+  # 确保分位数在显示范围内
+  display_range <- range(absolute_results$temperature)
+  temp_p1_display <- max(temp_p1, display_range[1])
+  temp_p99_display <- min(temp_p99, display_range[2])
+  
+  # 确定图表尺寸和布局参数
+  layout_heights <- c(0.618, 0.382)  # 黄金比例布局
+  
+  # 创建PNG图像
+  png_file <- file.path(save_path, "vivax_temperature_absolute_risk_distribution.png")
+  png(filename = png_file, width = 10, height = 8, units = "in", res = 300)
+  
+  # 设置布局
+  layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = layout_heights)
+  
+  # 设置绘图参数 - 上图
+  par(mar = c(0, 5, 4, 2), cex.axis = 1.1, cex.lab = 1.2, family = "sans")
+  
+  # 上图：温度对间日疟疾的绝对风险
+  # 自动确定Y轴单位和范围
+  max_rate <- max(absolute_results$absolute_rate, na.rm = TRUE)
+  min_rate <- min(absolute_results$absolute_rate, na.rm = TRUE)
+  
+  if(max_rate > 10) {
+    y_label <- "Incidence Rate (cases/100,000/unit)"
+    rate_multiplier <- 1
+  } else {
+    y_label <- "Relative Incidence Rate"
+    rate_multiplier <- 1
+  }
+  
+  # 更宽松的Y轴范围确保数据完整覆盖
+  y_min <- 0  # 从0开始更直观
+  y_max <- max_rate * 1.15  # 给上方留15%空间
+  
+  plot(absolute_results$temperature, absolute_results$absolute_rate, type = 'n', 
+       ylim = c(y_min, y_max),
+       xlim = range(absolute_results$temperature),
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # 添加网格线
+  temp_breaks <- pretty(absolute_results$temperature, n = 8)
+  y_breaks <- pretty(c(y_min, y_max), n = 6)
+  
+  abline(h = y_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  abline(v = temp_breaks, col = grid_color, lty = 3, lwd = 0.8)
+  
+  # 添加参考线 - 使用优化配色
+  abline(v = reference_temp, col = ref_temp_color, lty = 1, lwd = 2.5)
+  abline(v = temp_p1_display, col = ref_line_color, lty = 2, lwd = 1.8)
+  abline(v = temp_p99_display, col = p99_line_color, lty = 2, lwd = 1.8)
+  
+  # 绘制主曲线 - 使用优化配色
+  lines(absolute_results$temperature, absolute_results$absolute_rate, lwd = 3.5, col = main_line_color)
+  
+  # 添加参考点标记
+  ref_idx <- which.min(abs(absolute_results$temperature - reference_temp))
+  points(absolute_results$temperature[ref_idx], absolute_results$absolute_rate[ref_idx], 
+         col = ref_temp_color, pch = 19, cex = 2.0)
+  
+  # 添加转折点标记（如果存在）
+  if(!is.na(turning_point)) {
+    tp_idx <- which.min(abs(absolute_results$temperature - turning_point))
+    points(absolute_results$temperature[tp_idx], absolute_results$absolute_rate[tp_idx], 
+           col = main_line_color, pch = 17, cex = 2.0)
+  }
+  
+  # 添加Y轴
+  axis(2, at = y_breaks, labels = round(y_breaks, 1), 
+       las = 1, col.axis = text_color, col = "gray80", cex.axis = 1.1)
+  mtext(y_label, side = 2, line = 3.5, cex = 1.2, col = text_color, font = 2)
+  
+  # 添加标题
+  mtext("Temperature Effect on Vivax Malaria Absolute Incidence Risk (Peru)", 
+        side = 3, line = 1, cex = 1.5, font = 2, col = text_color)
+  
+  # 下图：温度频率分布直方图
+  par(mar = c(4.5, 5, 0.5, 2))
+  
+  # 使用与上图完全相同的X轴范围确保对齐
+  xlim_range <- range(absolute_results$temperature)
+  
+  # 过滤温度数据到与上图相同的显示范围
+  temp_filtered <- temp_data[temp_data >= xlim_range[1] & temp_data <= xlim_range[2]]
+  
+  # 创建直方图区间
+  actual_min <- min(temp_filtered, na.rm = TRUE)
+  actual_max <- max(temp_filtered, na.rm = TRUE)
+  buffer <- 0.1
+  safe_min <- floor(actual_min - buffer)
+  safe_max <- ceiling(actual_max + buffer)
+  
+  hist_breaks <- seq(safe_min, safe_max, by = 1)
+  if (max(hist_breaks) < safe_max) {
+    hist_breaks <- c(hist_breaks, safe_max)
+  }
+  
+  # 创建直方图
+  hist_result <- hist(temp_filtered, breaks = hist_breaks, plot = FALSE)
+  hist_percent <- hist_result$counts / sum(hist_result$counts) * 100
+  
+  # 绘制直方图背景
+  plot(1, 1, type = "n", 
+       xlim = xlim_range,
+       ylim = c(0, max(hist_percent) * 1.2), 
+       xlab = "", ylab = "", axes = FALSE)
+  
+  # 添加柱状图 - 使用优化配色
+  for(i in 1:length(hist_percent)) {
+    if(hist_breaks[i] <= xlim_range[2] && hist_breaks[i+1] >= xlim_range[1]) {
+      rect(hist_breaks[i], 0, hist_breaks[i+1], hist_percent[i], 
+           col = add.alpha(hist_fill_color, 0.8), 
+           border = add.alpha("#BDC3C7", 0.6))
+    }
+  }
+  
+  # 添加X轴
+  axis(1, at = temp_breaks, labels = temp_breaks, col.axis = text_color, col = "gray80", cex.axis = 1.1)
+  mtext("Temperature (°C)", side = 1, line = 3, cex = 1.2, col = text_color, font = 2)
+  
+  # 添加温度参考线 - 使用优化配色
+  abline(v = reference_temp, col = ref_temp_color, lty = 1, lwd = 2.5)
+  abline(v = temp_p1_display, col = ref_line_color, lty = 2, lwd = 1.8)
+  abline(v = temp_p99_display, col = p99_line_color, lty = 2, lwd = 1.8)
+  
+  # 添加均值线
+  temp_mean <- mean(temp_filtered, na.rm = TRUE)
+  abline(v = temp_mean, col = mean_line_color, lty = 1, lwd = 1.8)
+  
+  # 添加Y轴
+  y_ticks <- pretty(c(0, max(hist_percent)), n = 5)
+  axis(2, at = y_ticks, labels = paste0(format(y_ticks, digits = 1), "%"), 
+       las = 1, col.axis = text_color, col = "gray80", cex.axis = 1.1)
+  
+  # 改进的Y轴标签
+  mtext("Sample Distribution\nFrequency (%)", side = 2, line = 2.8, cex = 1.2, col = text_color)
+  
+  # 添加统计信息注释 - 使用优化配色
+  text(temp_mean, max(hist_percent) * 0.9, 
+       sprintf("Mean: %.1f°C", temp_mean), 
+       cex = 0.9, col = text_color, font = 2)
+  
+  text(temp_p1_display, max(hist_percent) * 0.7, 
+       sprintf("P1: %.1f°C", temp_p1), 
+       cex = 0.9, col = ref_line_color, font = 1)
+  
+  text(temp_p99_display, max(hist_percent) * 0.7, 
+       sprintf("P99: %.1f°C", temp_p99), 
+       cex = 0.9, col = p99_line_color, font = 1)
+  
+  # 添加边框
+  box(col = "gray80")
+  
+  dev.off()
+  
+  cat("间日疟疾绝对风险图表已保存至:", png_file, "\n")
+  cat("参考温度:", reference_temp, "°C\n")
+  cat("1%百分位数:", round(temp_p1, 1), "°C\n")
+  cat("99%百分位数:", round(temp_p99, 1), "°C\n")
+  
+  return(png_file)
+}
+
+##############################################################
+# 数据检查函数
+##############################################################
+check_vivax_data_requirements <- function(data) {
+  
+  cat("=== 间日疟疾数据要求检查 ===\n")
+  
+  required_vars <- c("Y1", "temperature", "pressure", "wind_speed", 
+                     "relative_humidity", "total_precipitation_sum",
+                     "cityid", "year", "week")
+  
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  
+  if(length(missing_vars) > 0) {
+    cat("缺失变量:", paste(missing_vars, collapse = ", "), "\n")
+    cat("请确保数据包含以上所有变量\n")
+    return(FALSE)
+  }
+  
+  cat("✓ 所有必需变量都存在\n")
+  
+  # 检查温度范围
+  temp_range <- range(data$temperature, na.rm = TRUE)
+  cat("温度范围:", round(temp_range[1], 1), "到", round(temp_range[2], 1), "°C\n")
+  
+  # 检查间日疟疾病例
+  y1_total <- sum(data$Y1, na.rm = TRUE)
+  cat("间日疟疾总病例数:", y1_total, "\n")
+  
+  cat("数据检查完成\n\n")
+  return(TRUE)
+}
+
+##############################################################
+# 主分析函数（包含相对风险和绝对风险）- 优化配色版本
+##############################################################
+run_vivax_temperature_analysis <- function(data_path = "D:/已结项目数据/秘鲁大论文全部/秘鲁大论文全部/merged_data.xlsx", 
+                                           reference_temp = 16.0,
+                                           save_path = "C:/Users/a1230/Desktop/jqxx") {
+  
+  cat("=== 开始间日疟疾温度分析（优化配色版本）===\n")
+  
+  # 确保保存路径存在
+  if(!dir.exists(save_path)) {
+    dir.create(save_path, recursive = TRUE)
+    cat("创建保存路径:", save_path, "\n")
+  }
+  
+  # 读取数据
+  data <- read_excel(data_path)
+  setDT(data)
+  
+  cat("原始数据行数:", nrow(data), "\n")
+  
+  # 数据检查
+  if(!check_vivax_data_requirements(data)) {
+    stop("数据检查失败，请检查数据格式")
+  }
+  
+  # 数据预处理
+  processed_data <- prepare_vivax_data(data, reference_temp)
+  data_processed <- processed_data$data
+  offset_available <- processed_data$offset_available
+  
+  # 显示温度范围
+  temp_range <- range(data_processed$temperature, na.rm = TRUE)
+  cat("完整温度范围:", round(temp_range[1], 1), "到", round(temp_range[2], 1), "°C\n")
+  
+  # 步骤1：估计间日疟疾模型2
+  model_vivax <- estimate_vivax_model2(data_processed, offset_available, reference_temp)
+  
+  # 步骤2：计算温度边际效应（相对风险）
+  pred_results_relative <- calculate_vivax_temperature_effects(model_vivax, temp_range, reference_temp)
+  
+  # 步骤3：计算绝对风险
+  pred_results_absolute <- calculate_vivax_absolute_risk(model_vivax, temp_range, data_processed, reference_temp)
+  
+  # 步骤4：创建相对风险分层图（风险曲线 + 温度分布）- 优化配色版本
+  plot_file_relative <- plot_vivax_temperature_risk_with_distribution(
+    relative_results = pred_results_relative,
+    temp_data = data_processed$temperature,
+    data = data_processed,
+    save_path = save_path
+  )
+  
+  # 步骤5：创建绝对风险分层图（绝对风险曲线 + 温度分布）- 优化配色版本
+  plot_file_absolute <- plot_vivax_absolute_risk_with_distribution(
+    absolute_results = pred_results_absolute,
+    temp_data = data_processed$temperature,
+    data = data_processed,
+    save_path = save_path
+  )
+  
+  # 验证参考点
+  cat("\n=== 参考点验证 ===\n")
+  ref_idx <- which.min(abs(pred_results_relative$temperature - reference_temp))
+  cat("在参考温度", round(reference_temp, 1), "°C处的相对风险比:", 
+      round(pred_results_relative$relative_risk[ref_idx], 4), "\n")
+  cat("(应该接近1.0，证明中心化正确)\n")
+  
+  # 温度范围分析
+  cat("\n=== 温度范围分析 ===\n")
+  cat("数据覆盖温度范围:", round(temp_range[1], 1), "°C 到", round(temp_range[2], 1), "°C\n")
+  cat("温度跨度:", round(temp_range[2] - temp_range[1], 1), "°C\n")
+  
+  # 极端温度风险
+  low_temp_idx <- which.min(pred_results_relative$temperature)
+  high_temp_idx <- which.max(pred_results_relative$temperature)
+  
+  cat("\n=== 相对风险分析 ===\n")
+  cat("最低温度", round(pred_results_relative$temperature[low_temp_idx], 1), "°C风险:\n")
+  cat("  - 相对风险比:", round(pred_results_relative$relative_risk[low_temp_idx], 3), "\n")
+  
+  cat("最高温度", round(pred_results_relative$temperature[high_temp_idx], 1), "°C风险:\n")
+  cat("  - 相对风险比:", round(pred_results_relative$relative_risk[high_temp_idx], 3), "\n")
+  
+  cat("\n=== 绝对风险分析 ===\n")
+  cat("最低温度", round(pred_results_absolute$temperature[low_temp_idx], 1), "°C处:\n")
+  cat("  - 绝对发病率:", round(pred_results_absolute$absolute_rate[low_temp_idx], 2), "\n")
+  
+  cat("参考温度", round(reference_temp, 1), "°C处:\n")
+  cat("  - 绝对发病率:", round(pred_results_absolute$absolute_rate[ref_idx], 2), "\n")
+  
+  cat("最高温度", round(pred_results_absolute$temperature[high_temp_idx], 1), "°C处:\n")
+  cat("  - 绝对发病率:", round(pred_results_absolute$absolute_rate[high_temp_idx], 2), "\n")
+  
+  # 返回结果
+  return(list(
+    model_vivax = model_vivax,
+    predictions_relative = pred_results_relative,
+    predictions_absolute = pred_results_absolute,
+    plot_file_relative = plot_file_relative,
+    plot_file_absolute = plot_file_absolute,
+    reference_temp = reference_temp,
+    data_processed = data_processed,
+    temperature_range = temp_range,
+    save_path = save_path
+  ))
+}
+
+##############################################################
+# 使用示例
+##############################################################
+
+cat("=== 间日疟疾温度非线性效应分析代码（优化配色版本）===\n")
+cat("配色优化:\n")
+cat("1. ✅ 主线采用现代红色 #E74C3C（参考第二个代码falciparum配色）\n")
+cat("2. ✅ 置信区间采用优雅浅红色 #FADBD8，与主线色调一致\n")
+cat("3. ✅ 直方图采用稍深浅蓝色 #D4EEFC，保持视觉一致性\n")
+cat("4. ✅ 参考线采用标准蓝色 #3498DB（参考第二个代码vivax配色）\n")
+cat("5. ✅ P99线采用橙色 #F39C12，形成温暖对比\n")
+cat("6. ✅ 文字采用深蓝灰色 #2C3E50，提升专业感\n")
+cat("7. ✅ 网格线更淡 #F0F0F0，减少视觉干扰\n")
+cat("8. ✅ 参考温度线采用深灰蓝色 #34495E，突出重要性\n\n")
+
+cat("使用方法:\n")
+cat("results <- run_vivax_temperature_analysis(\n")
+cat("  data_path = 'D:/已结项目数据/秘鲁大论文全部/秘鲁大论文全部/merged_data.xlsx',\n")
+cat("  reference_temp = 16.0,\n")
+cat("  save_path = 'C:/Users/a1230/Desktop/jqxx'\n")
+cat(")\n\n")
+
+cat("输出内容:\n")
+cat("- 间日疟疾模型2估计结果\n")
+cat("- 温度相对风险曲线 + 温度分布图（优化配色版）\n")
+cat("- 温度绝对风险曲线 + 温度分布图（优化配色版）\n")
+cat("- 保存至指定文件夹\n\n")
+
+cat("=== 运行分析 ===\n")
+# 自动运行分析
+results <- run_vivax_temperature_analysis()
+
+cat("\n=== 间日疟疾温度分析完成（优化配色版本）===\n")
+cat("可用结果:\n")
+cat("- results$model_vivax: 间日疟疾模型2对象\n")
+cat("- results$predictions_relative: 相对风险预测结果\n")
+cat("- results$predictions_absolute: 绝对风险预测结果\n")
+cat("- results$plot_file_relative: 相对风险图像文件路径\n")
+cat("- results$plot_file_absolute: 绝对风险图像文件路径\n")
+cat("- results$temperature_range: 温度范围\n")
+
+cat("\n=== 配色优化特性（参考第二个代码）===\n")
+cat("🎨 配色优化:\n")
+cat("   - 采用现代专业配色方案\n")
+cat("   - 主线红色与置信区间浅红色形成和谐统一\n")
+cat("   - 参考线色彩分层清晰易识别\n")
+cat("   - 文字和边框颜色提升整体专业感\n\n")
+cat("📊 视觉改进:\n")
+cat("   - 保持疟疾研究领域的红色主题\n")
+cat("   - 蓝色系辅助色彩平衡视觉效果\n")
+cat("   - 网格线和边框色彩更加柔和\n")
+cat("   - 整体配色方案更加现代专业\n\n")
+cat("🔧 技术保持:\n")
+cat("   - 保留原有布局和绘图逻辑\n")
+cat("   - 仅优化配色方案和视觉效果\n")
+cat("   - 确保所有功能正常运行\n")
+cat("   - 高分辨率PNG输出 (300dpi, 10x8英寸)\n")
